@@ -8,12 +8,37 @@ from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
 from models import ContractExtraction, ExtractedField, Obligation
 
+import time
+
 load_dotenv()
 
-def get_gemini_client():
+def notify_ui(msg: str):
+    """Shows user-friendly toast/status message in Streamlit UI and logs to server."""
+    try:
+        import streamlit as st
+        from streamlit.runtime import exists
+        if exists() and hasattr(st, "toast"):
+            st.toast(msg, icon="⏳")
+    except Exception:
+        pass
+    print(f"[Gemini Resilience] {msg}")
+
+def get_api_key() -> str:
+    """Retrieves Gemini API Key from environment or Streamlit secrets safely."""
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or api_key == "your_gemini_api_key_here":
-        return None, "GEMINI_API_KEY is missing or invalid in environment variables (.env)."
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+                api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
+        except Exception:
+            pass
+    return api_key
+
+def get_gemini_client():
+    api_key = get_api_key()
+    if not api_key or api_key == "your_gemini_api_key_here":
+        return None, "GEMINI_API_KEY is missing or invalid in environment variables (.env) or Streamlit secrets."
     
     # Try importing google.genai or google.generativeai
     try:
@@ -26,58 +51,109 @@ def get_gemini_client():
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        return ("old_sdk", model), None
+        return ("old_sdk", genai), None
     except Exception as e:
         return None, f"Failed to initialize Gemini API client: {str(e)}"
 
 
+_HEALTHY_MODEL_CACHE = None
+
 def call_gemini_model(prompt: str, json_mode: bool = True) -> str:
-    """Helper to execute prompt with Gemini API using gemini-2.5-flash."""
+    """
+    Helper to execute prompt with Gemini API using dynamic fast-fallback circuit breaker:
+    1. Primary candidate order: gemini-3.5-flash (fastest, high availability) -> gemini-3.6-flash -> gemini-3.5-flash-lite
+    2. Caches currently healthy model to eliminate latency on subsequent sub-agent calls.
+    3. Fast 1-retry fallback on 503 capacity spikes.
+    """
+    global _HEALTHY_MODEL_CACHE
+
     client_tuple, err = get_gemini_client()
     if err or not client_tuple:
         raise ValueError(err or "Gemini API client not configured.")
 
-    sdk_type, client_or_model = client_tuple
-    target_model = "gemini-2.5-flash"
+    sdk_type, client_or_sdk = client_tuple
+    
+    env_model = os.getenv("GEMINI_MODEL", "").strip()
+    default_candidates = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    
+    candidate_models = []
+    if env_model:
+        candidate_models.append(env_model)
+    if _HEALTHY_MODEL_CACHE and _HEALTHY_MODEL_CACHE not in candidate_models:
+        candidate_models.append(_HEALTHY_MODEL_CACHE)
+    for m in default_candidates:
+        if m not in candidate_models:
+            candidate_models.append(m)
 
-    if sdk_type == "new_sdk":
-        from google.genai import types
-        config = types.GenerateContentConfig(
-            temperature=0.1,
-        )
-        if json_mode:
-            config.response_mime_type = "application/json"
-        
-        try:
-            response = client_or_model.models.generate_content(
-                model=target_model,
-                contents=prompt,
-                config=config
-            )
-            if response and response.text:
-                return response.text
-            raise RuntimeError("Empty response received from Gemini API.")
-        except Exception as e:
-            raise RuntimeError(f"Gemini API Error (model: {target_model}): {str(e)}")
-    else:
-        # old_sdk
-        import google.generativeai as genai
-        generation_config = {"temperature": 0.1}
-        if json_mode:
-            generation_config["response_mime_type"] = "application/json"
-            
-        try:
-            model_inst = genai.GenerativeModel(target_model)
-            response = model_inst.generate_content(
-                prompt,
-                generation_config=generation_config
-            )
-            if response and response.text:
-                return response.text
-            raise RuntimeError("Empty response received from Gemini API.")
-        except Exception as e:
-            raise RuntimeError(f"Gemini API Error (model: {target_model}): {str(e)}")
+    last_exception = None
+
+    for model_index, target_model in enumerate(candidate_models):
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            try:
+                if sdk_type == "new_sdk":
+                    from google.genai import types
+                    config = types.GenerateContentConfig(
+                        temperature=0.1,
+                    )
+                    if json_mode:
+                        config.response_mime_type = "application/json"
+                    
+                    response = client_or_sdk.models.generate_content(
+                        model=target_model,
+                        contents=prompt,
+                        config=config
+                    )
+                    if response and response.text:
+                        _HEALTHY_MODEL_CACHE = target_model
+                        return response.text
+                    raise RuntimeError(f"Empty response returned by Gemini model '{target_model}'.")
+                else:
+                    # old_sdk
+                    import google.generativeai as genai
+                    generation_config = {"temperature": 0.1}
+                    if json_mode:
+                        generation_config["response_mime_type"] = "application/json"
+                    
+                    model_inst = genai.GenerativeModel(target_model)
+                    response = model_inst.generate_content(
+                        prompt,
+                        generation_config=generation_config
+                    )
+                    if response and response.text:
+                        _HEALTHY_MODEL_CACHE = target_model
+                        return response.text
+                    raise RuntimeError(f"Empty response returned by Gemini model '{target_model}'.")
+
+            except Exception as e:
+                last_exception = e
+                err_str = str(e)
+                
+                is_transient = any(code in err_str for code in [
+                    "503", "UNAVAILABLE", "high demand", "ResourceExhausted",
+                    "429", "overloaded", "temporarily unavailable", "DeadlineExceeded"
+                ])
+                
+                if is_transient:
+                    if attempt < max_attempts - 1:
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        if model_index < len(candidate_models) - 1:
+                            next_model = candidate_models[model_index + 1]
+                            notify_ui(f"Model '{target_model}' busy (503). Auto-switching to '{next_model}'...")
+                            break
+                else:
+                    if "404" in err_str or "NOT_FOUND" in err_str:
+                        if model_index < len(candidate_models) - 1:
+                            next_model = candidate_models[model_index + 1]
+                            notify_ui(f"Model '{target_model}' unavailable. Auto-switching to '{next_model}'...")
+                            break
+                    if model_index == len(candidate_models) - 1:
+                        break
+
+    print(f"[Gemini Resilience Error] All models failed. Last error: {last_exception}")
+    raise RuntimeError("Gemini AI service is currently experiencing high demand. Automatic retries and fallback models were attempted. Please try again in a moment.")
 
 
 def clean_json_text(text: str) -> str:
