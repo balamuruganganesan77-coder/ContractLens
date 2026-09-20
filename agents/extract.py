@@ -282,10 +282,18 @@ Return ONLY a valid JSON object matching this schema:
         if not parties_list:
             parties_list = [ExtractedField(field_name="Party", value="Not found in contract", source_page=1)]
 
+        def parse_str(val: Any, default: str) -> str:
+            if isinstance(val, str):
+                return val.strip() or default
+            if isinstance(val, dict):
+                v = val.get("value") or val.get("contract_title") or val.get("contract_type") or val.get("executive_summary") or default
+                return str(v).strip() or default
+            return str(val) if val is not None else default
+
         extraction = ContractExtraction(
-            contract_title=data.get("contract_title", filename),
-            contract_type=data.get("contract_type", "Agreement"),
-            executive_summary=data.get("executive_summary", "Contract agreement between parties."),
+            contract_title=parse_str(data.get("contract_title"), filename),
+            contract_type=parse_str(data.get("contract_type"), "Agreement"),
+            executive_summary=parse_str(data.get("executive_summary"), "Contract agreement between parties."),
             parties=parties_list,
             effective_date=make_field(data.get("effective_date"), "Effective Date"),
             expiration_date=make_field(data.get("expiration_date"), "Expiration Date"),
